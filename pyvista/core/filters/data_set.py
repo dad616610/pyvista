@@ -7066,7 +7066,7 @@ class DataSetFilters:
         inplace : bool, default: False
             When ``True``, modifies the dataset inplace.
 
-        progress_bar : bool, default: False
+        progress_bar : bool, default: True
             Display a progress bar to indicate progress.
 
         Returns
