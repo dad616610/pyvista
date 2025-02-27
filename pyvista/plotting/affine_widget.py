@@ -360,7 +360,9 @@ class AffineWidget3D:
                 vec_init /= np.linalg.norm(vec_init)
                 angle = get_angle(vec_init, vec_current)
                 cross = np.cross(vec_init, vec_current)
-                if cross[index] < 0:
+                # flip the angle if we should rotate in the opposite direction
+                # or if the normal points along the negative axis, but not both
+                if (cross[index] < 0) ^ (np.dot(-GLOBAL_AXES[index], normal) > 0):
                     angle = -angle
 
                 trans = _vtk.vtkTransform()
