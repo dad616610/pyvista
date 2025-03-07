@@ -1,8 +1,13 @@
 from __future__ import annotations
 
+from code import interact
 from collections.abc import Mapping
 from dataclasses import dataclass
+import dataclasses
+from functools import partial
+import gc
 from platform import release
+from tabnanny import check
 from typing import TYPE_CHECKING, MutableMapping, reveal_type
 from typing import Literal
 from unittest.mock import ANY
@@ -550,7 +555,10 @@ def test_get_angle():
 
 
 # can't use `needs_vtk_version(9, 2)` here, because of inverted condition
-@pytest.mark.skipif(pv.vtk_version_info >= (9, 2))
+@pytest.mark.skipif(
+    pv.vtk_version_info >= (9, 2),
+    reason='VTK >= 9.2, no VTKVersionError will be raised',
+)
 def test_affine_widget_vtk_error(sphere):
     pl = pv.Plotter(window_size=(400, 400))
     actor = pl.add_mesh(sphere)
@@ -564,6 +572,16 @@ class AffWid:
     pl: pv.Plotter
     actor: pv.Actor
     widget: pv.widgets.AffineWidget3D
+    interact_calls: list[np.array] = dataclasses.field(default_factory=list)
+    release_calls: list[np.array] = dataclasses.field(default_factory=list)
+    width: int = dataclasses.field(init=False)
+    height: int = dataclasses.field(init=False)
+    w: int = dataclasses.field(init=False)
+    h: int = dataclasses.field(init=False)
+
+    def __post_init__(self):
+        self.width, self.height = self.pl.window_size
+        self.w, self.h = self.width // 2, self.height // 2
 
 
 @pytest.fixture
@@ -575,12 +593,19 @@ def aff_wid(request, sphere) -> AffWid:
     pl = pv.Plotter(window_size=(400, 400))
     actor = pl.add_mesh(sphere)
 
+    # assign dummy widget for now
+    aw = AffWid(pl, actor, None)
+
     if hasattr(request, 'param'):
         params = request.param
-        assert isinstance(params, (Mapping)), (
+        assert isinstance(params, (MutableMapping)), (
             'parameters passed to `parametrize` should be a mapping'
         )
+        use_callbacks = params.pop('use_callbacks', False)
         payload = params
+        if use_callbacks:
+            payload['interact_callback'] = lambda t: aw.interact_calls.append(t)
+            payload['release_callback'] = lambda t: aw.release_calls.append(t)
     else:
         payload = {}
     widget = pl.add_affine_transform_widget(
@@ -590,7 +615,8 @@ def aff_wid(request, sphere) -> AffWid:
     # causing GC errors
     pl.show(auto_close=False)
 
-    yield AffWid(pl, actor, widget)
+    aw.widget = widget
+    yield aw
 
     # didn't resolve the GC problem
     widget.disable()
@@ -600,36 +626,18 @@ def aff_wid(request, sphere) -> AffWid:
     pl.deep_clean()
 
 
-@pytest.mark.parametrize(
-    'aff_wid',
-    [
-        {'origin': (0, 100, 100)},
-    ],
-    indirect=True,
-)
-def test_fix(aff_wid, skip_check_gc):
-    print(aff_wid.widget.origin)
-    assert True
-
-
-@flaky_test
-def test_affine_widget(sphere):
-    interact_calls = []
-    release_calls = []
-
-    def interact_callback(transform):
-        interact_calls.append(transform)
-
-    def release_callback(transform):
-        release_calls.append(transform)
-
+def test_affine_widget_vtk_version(sphere):
     pl = pv.Plotter(window_size=(400, 400))
     actor = pl.add_mesh(sphere)
 
     if pv.vtk_version_info < (9, 2):
         with pytest.raises(VTKVersionError):
             pl.add_affine_transform_widget(actor)
-        return
+
+
+def test_affine_widget_invalid_init(sphere):
+    pl = pv.Plotter(window_size=(400, 400))
+    actor = pl.add_mesh(sphere)
 
     with pytest.raises(TypeError, match='callable'):
         pl.add_affine_transform_widget(actor, interact_callback='foo')
@@ -641,18 +649,13 @@ def test_affine_widget(sphere):
     with pytest.raises(ValueError, match='right hand'):
         pl.add_affine_transform_widget(actor, axes=axes)
 
-    widget = pl.add_affine_transform_widget(
-        actor,
-        interact_callback=interact_callback,
-        release_callback=release_callback,
-    )
-    pl.show(auto_close=False)
 
+def test_affine_widget_actor_selection_deseletion(aff_wid, skip_check_gc):
+    pl, widget = aff_wid.pl, aff_wid.widget
     assert not widget._selected_actor
 
     # move in the center and ensure that an actor is selected
-    width, height = pl.window_size
-    pl.iren._mouse_move(width // 2, height // 2)
+    pl.iren._mouse_move(aff_wid.w, aff_wid.h)
     assert widget._selected_actor in widget._arrows + widget._circles
     assert widget._selected_actor.prop.color == pv.Color(DARK_YELLOW)
 
@@ -660,127 +663,216 @@ def test_affine_widget(sphere):
     pl.iren._mouse_move(0, 0)
     assert not widget._selected_actor
 
-    def test_translation(
-        press_pos: tuple[float, float],
-        move_pos: tuple[float, float],
-        idx: int,
-        direction: Literal['neg', 'pos'],
-    ):
-        pl.iren._mouse_left_button_press(*press_pos)
-        assert widget._selected_actor is widget._arrows[idx]
-        assert widget._pressing_down
 
-        pl.iren._mouse_move(*move_pos)
-        trans_val = actor.user_matrix[idx, 3]
-        assert (trans_val < 0) if direction == 'neg' else (trans_val > 0)
+@dataclass
+class Params:
+    press_pos: tuple[int, int]
+    move_pos: tuple[int, int]
+    idx: int  # axis index
 
-        pl.iren._mouse_left_button_release(*move_pos)
-        trans_val = actor.user_matrix[idx, 3]
-        assert (trans_val < 0) if direction == 'neg' else (trans_val > 0)
-        assert not widget._pressing_down
-        widget._reset()
-        assert np.allclose(widget._cached_matrix, np.eye(4))
 
-    # test X axis translation
-    test_translation(
-        press_pos=(width // 2 - 4, height // 2 - 4),
-        move_pos=(width, height // 2),
-        idx=0,
-        direction='neg',
+@dataclass
+class TranslationParams(Params):
+    direction: Literal['pos', 'neg']
+
+
+@dataclass
+class RotationParams(Params):
+    rotation: Literal['ccw', 'cw']
+
+
+def _test_translation(
+    aw: AffWid,
+    trans_params: TranslationParams,
+    check_callbacks: bool = False,
+):
+    press_pos, move_pos, idx, direction = dataclasses.astuple(trans_params)
+
+    aw.pl.iren._mouse_left_button_press(*press_pos)
+    assert aw.widget._selected_actor is aw.widget._arrows[idx]
+    assert aw.widget._pressing_down
+
+    aw.pl.iren._mouse_move(*move_pos)
+    trans_val = aw.actor.user_matrix[idx, 3]
+    assert (trans_val < 0) if direction == 'neg' else (trans_val > 0)
+
+    # this counts as interaction if a value is passed, but doesn't
+    # if no value is passed, kind of strange?
+    aw.pl.iren._mouse_left_button_release(*move_pos)
+    trans_val = aw.actor.user_matrix[idx, 3]
+    assert (trans_val < 0) if direction == 'neg' else (trans_val > 0)
+    assert not aw.widget._pressing_down
+    aw.widget._reset()
+    assert np.allclose(aw.widget._cached_matrix, np.eye(4))
+
+    if check_callbacks:
+        # test callback called
+        assert len(aw.interact_calls) == 2
+        assert aw.interact_calls[0].shape == (4, 4)
+        assert len(aw.release_calls) == 1
+        assert aw.release_calls[0].shape == (4, 4)
+
+
+def use_callbacks(test_func):
+    return pytest.mark.parametrize(
+        'aff_wid',
+        [
+            {'use_callbacks': True},
+        ],
+        indirect=True,
+    )(test_func)
+
+
+@use_callbacks
+def test_affine_widget_x_translation(aff_wid, skip_check_gc):
+    _test_translation(
+        aff_wid,
+        TranslationParams(
+            press_pos=(aff_wid.w - 4, aff_wid.h - 4),
+            move_pos=(aff_wid.width, aff_wid.h),
+            idx=0,
+            direction='neg',
+        ),
+        check_callbacks=True,
     )
 
-    # test callback called
-    assert len(interact_calls) == 2
-    assert interact_calls[0].shape == (4, 4)
-    assert len(release_calls) == 1
-    assert release_calls[0].shape == (4, 4)
 
-    # test Y axis translation
-    test_translation(
-        press_pos=(width // 2 + 2, height // 2 - 3),
-        move_pos=(width, height // 2),
-        idx=1,
-        direction='pos',
+@use_callbacks
+def test_affine_widget_y_translation(aff_wid, skip_check_gc):
+    _test_translation(
+        aff_wid,
+        TranslationParams(
+            press_pos=(aff_wid.w + 2, aff_wid.h - 3),
+            move_pos=(aff_wid.width, aff_wid.h),
+            idx=1,
+            direction='pos',
+        ),
+        check_callbacks=True,
     )
 
-    # test Z axis translation
-    test_translation(
-        press_pos=(width // 2, height // 2 + 5),
-        move_pos=(width // 2, 0),
-        idx=2,
-        direction='neg',
+
+@use_callbacks
+def test_affine_widget_z_translation(aff_wid, skip_check_gc):
+    _test_translation(
+        aff_wid,
+        TranslationParams(
+            press_pos=(aff_wid.w, aff_wid.h + 5),
+            move_pos=(aff_wid.w, 0),
+            idx=2,
+            direction='neg',
+        ),
+        check_callbacks=True,
     )
 
-    def test_rotation(
-        press_pos: tuple[float, float],
-        move_pos: tuple[float, float],
-        idx: int,
-        rotation: Literal['ccw', 'cw'],
-    ):
-        pl.iren._mouse_left_button_press(*press_pos)
-        assert widget._selected_actor is widget._circles[idx]
-        assert widget._pressing_down
-        pl.iren._mouse_move(*move_pos)
-        euler_angles = r_mat_to_euler_angles(actor.user_matrix)
-        assert euler_angles[idx] > 0 if rotation == 'ccw' else euler_angles[idx] < 0
-        assert np.count_nonzero(np.isclose(euler_angles, 0)) == len(euler_angles) - 1
-        pl.iren._mouse_left_button_release()
-        assert not widget._pressing_down
-        widget._reset()
-        assert np.allclose(widget._cached_matrix, np.eye(4))
 
+def _test_rotation(
+    aw: AffWid,
+    rot_params: RotationParams,
+    check_callbacks: bool = False,
+):
+    press_pos, move_pos, idx, rotation = dataclasses.astuple(rot_params)
+
+    aw.pl.iren._mouse_left_button_press(*press_pos)
+    assert aw.widget._selected_actor is aw.widget._circles[idx]
+    assert aw.widget._pressing_down
+    aw.pl.iren._mouse_move(*move_pos)
+    euler_angles = r_mat_to_euler_angles(aw.actor.user_matrix)
+    assert euler_angles[idx] > 0 if rotation == 'ccw' else euler_angles[idx] < 0
+    assert np.count_nonzero(np.isclose(euler_angles, 0)) == len(euler_angles) - 1
+    aw.pl.iren._mouse_left_button_release(*move_pos)
+    assert not aw.widget._pressing_down
+    aw.widget._reset()
+    assert np.allclose(aw.widget._cached_matrix, np.eye(4))
+
+    if check_callbacks:
+        # test callback called
+        assert len(aw.interact_calls) == 2
+        assert aw.interact_calls[0].shape == (4, 4)
+        assert len(aw.release_calls) == 1
+        assert aw.release_calls[0].shape == (4, 4)
+
+
+@use_callbacks
+def test_affine_widget_x_rotation(aff_wid, skip_check_gc):
     # test X axis rotation, counterclockwise
-    test_rotation(
-        press_pos=(width // 2 + 30, height // 2),
-        move_pos=(width // 2 + 21, height // 2 + 17),
-        idx=0,
-        rotation='ccw',
+    _test_rotation(
+        aff_wid,
+        RotationParams(
+            press_pos=(aff_wid.w + 30, aff_wid.h),
+            move_pos=(aff_wid.w + 21, aff_wid.h + 17),
+            idx=0,
+            rotation='ccw',
+        ),
+        check_callbacks=True,
     )
 
+
+@use_callbacks
+def test_affine_widget_y_rotation(aff_wid, skip_check_gc):
     # test Y axis rotation, counterclockwise
-    test_rotation(
-        press_pos=(width // 2 - 20, height // 2 + 20),
-        move_pos=(width // 2 - 30, height // 2 + 4),
-        idx=1,
-        rotation='ccw',
+    _test_rotation(
+        aff_wid,
+        RotationParams(
+            press_pos=(aff_wid.w - 20, aff_wid.h + 20),
+            move_pos=(aff_wid.w - 30, aff_wid.h + 4),
+            idx=1,
+            rotation='ccw',
+        ),
+        check_callbacks=True,
     )
 
+
+@use_callbacks
+def test_affine_widget_z_rotation(aff_wid, skip_check_gc):
     # test Z axis rotation, clockwise
-    test_rotation(
-        press_pos=(width // 2, height // 2 - 29),
-        move_pos=(width // 2 - 12, height // 2 - 23),
-        idx=2,
-        rotation='cw',
+    _test_rotation(
+        aff_wid,
+        RotationParams(
+            press_pos=(aff_wid.w, aff_wid.h - 29),
+            move_pos=(aff_wid.w - 12, aff_wid.h - 23),
+            idx=2,
+            rotation='cw',
+        ),
+        check_callbacks=True,
     )
 
+
+@use_callbacks
+def test_affine_widget_change_axes(aff_wid, skip_check_gc):
     # test change axes
     axes = np.array(
         [[0.70710678, 0.70710678, 0.0], [-0.70710678, 0.70710678, 0.0], [0.0, 0.0, 1.0]],
     )
-    widget.axes = axes
-    assert np.allclose(widget.axes, axes)
+    aff_wid.widget.axes = axes
+    assert np.allclose(aff_wid.widget.axes, axes)
 
     # test X axis translation with new axes
-    test_translation(
-        press_pos=(width // 2, height // 2 - 38),
-        move_pos=(width // 2, height // 2 - 50),
-        idx=0,
-        direction='pos',
+    _test_translation(
+        aff_wid,
+        TranslationParams(
+            press_pos=(aff_wid.w, aff_wid.h - 38),
+            move_pos=(aff_wid.w, aff_wid.h - 50),
+            idx=0,
+            direction='pos',
+        ),
+        check_callbacks=True,
     )
 
-    # test origin
+
+def test_affine_widget_change_origin(aff_wid, skip_check_gc):
     origin = np.random.default_rng().random(3)
-    widget.origin = origin
-    assert np.allclose(widget.origin, origin)
+    aff_wid.widget.origin = origin
+    assert np.allclose(aff_wid.widget.origin, origin)
 
-    # test disable
-    assert pl._picker_in_use
-    widget.disable()
-    assert not pl._picker_in_use
 
-    widget.remove()
-    assert not widget._circles
-    assert not widget._arrows
+def test_affine_widget_clean_up(aff_wid, skip_check_gc):
+    assert aff_wid.pl._picker_in_use
+    aff_wid.widget.disable()
+    assert not aff_wid.pl._picker_in_use
+
+    aff_wid.widget.remove()
+    assert not aff_wid.widget._circles
+    assert not aff_wid.widget._arrows
 
 
 def test_logo_widget(verify_image_cache):
