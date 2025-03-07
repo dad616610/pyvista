@@ -1,11 +1,15 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from collections.abc import Mapping
+from dataclasses import dataclass
+from platform import release
+from typing import TYPE_CHECKING, MutableMapping, reveal_type
 from typing import Literal
 from unittest.mock import ANY
 
 import numpy as np
 import pytest
+from tests.plotting.conftest import skip_check_gc
 import vtk
 
 import pyvista as pv
@@ -543,6 +547,69 @@ def test_get_angle():
     result_angle = get_angle(v1, v2)
 
     assert np.isclose(result_angle, expected_angle, atol=1e-8)
+
+
+# can't use `needs_vtk_version(9, 2)` here, because of inverted condition
+@pytest.mark.skipif(pv.vtk_version_info >= (9, 2))
+def test_affine_widget_vtk_error(sphere):
+    pl = pv.Plotter(window_size=(400, 400))
+    actor = pl.add_mesh(sphere)
+
+    with pytest.raises(VTKVersionError):
+        pl.add_affine_transform_widget(actor)
+
+
+@dataclass
+class AffWid:
+    pl: pv.Plotter
+    actor: pv.Actor
+    widget: pv.widgets.AffineWidget3D
+
+
+@pytest.fixture
+def aff_wid(request, sphere) -> AffWid:
+    # can't use `needs_vtk_version(9, 2)` here, because it's a fixture, not test
+    if pv.vtk_version_info < (9, 2):
+        pytest.skip(reason='Requires VTK >= v9.2')
+
+    pl = pv.Plotter(window_size=(400, 400))
+    actor = pl.add_mesh(sphere)
+
+    if hasattr(request, 'param'):
+        params = request.param
+        assert isinstance(params, (Mapping)), (
+            'parameters passed to `parametrize` should be a mapping'
+        )
+        payload = params
+    else:
+        payload = {}
+    widget = pl.add_affine_transform_widget(
+        actor,
+        **payload,
+    )
+    # causing GC errors
+    pl.show(auto_close=False)
+
+    yield AffWid(pl, actor, widget)
+
+    # didn't resolve the GC problem
+    widget.disable()
+    widget.remove()
+    pl.clear()
+    pl.close()
+    pl.deep_clean()
+
+
+@pytest.mark.parametrize(
+    'aff_wid',
+    [
+        {'origin': (0, 100, 100)},
+    ],
+    indirect=True,
+)
+def test_fix(aff_wid, skip_check_gc):
+    print(aff_wid.widget.origin)
+    assert True
 
 
 @flaky_test
